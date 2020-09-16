@@ -2,12 +2,13 @@ package install
 
 import (
 	"fmt"
-	"github.com/fanux/sealos/cert"
-	"github.com/fanux/sealos/ipvs"
-	"github.com/wonderivan/logger"
 	"path"
 	"strings"
 	"sync"
+
+	"github.com/fanux/sealos/cert"
+	"github.com/fanux/sealos/ipvs"
+	"github.com/wonderivan/logger"
 )
 
 //BuildJoin is
@@ -58,22 +59,27 @@ func joinNodesFunc(joinNodes []string) {
 //GeneratorToken is
 //这里主要是为了获取CertificateKey
 func (s *SealosInstaller) GeneratorCerts() {
-	cmd := `kubeadm init phase upload-certs --upload-certs`
+	cmd := `kubeadm init phase upload-certs --upload-certs` + vlogToStr()
 	output := SSHConfig.CmdToString(s.Masters[0], cmd, "\r\n")
 	logger.Debug("[globals]decodeCertCmd: %s", output)
 	slice := strings.Split(output, "Using certificate key:\r\n")
 	slice1 := strings.Split(slice[1], "\r\n")
 	CertificateKey = slice1[0]
-	cmd = "kubeadm token create --print-join-command"
+	cmd = "kubeadm token create --print-join-command" + vlogToStr()
 	out := SSHConfig.Cmd(s.Masters[0], cmd)
 	decodeOutput(out)
 }
 
 //GeneratorToken is
 func (s *SealosInstaller) GeneratorToken() {
-	cmd := `kubeadm token create --print-join-command`
+	cmd := `kubeadm token create --print-join-command` + vlogToStr()
 	output := SSHConfig.Cmd(s.Masters[0], cmd)
 	decodeOutput(output)
+}
+
+// 返回/etc/hosts记录
+func getApiserverHost(ipAddr string) (host string) {
+	return fmt.Sprintf("%s %s", ipAddr, ApiServer)
 }
 
 //JoinMasters is
@@ -81,6 +87,8 @@ func (s *SealosInstaller) JoinMasters(masters []string) {
 	var wg sync.WaitGroup
 	//copy certs
 	s.sendCaAndKey(masters)
+
+	s.SendKubeConfigs(masters, false)
 	//join master do sth
 	cmd := s.Command(Version, JoinMaster)
 	for _, master := range masters {
@@ -88,17 +96,18 @@ func (s *SealosInstaller) JoinMasters(masters []string) {
 		go func(master string) {
 			defer wg.Done()
 			hostname := GetRemoteHostName(master)
-			certCMD := cert.CertCMD(ApiServerCertSANs, IpFormat(master), hostname, SvcCIDR)
+			certCMD := cert.CertCMD(ApiServerCertSANs, IpFormat(master), hostname, SvcCIDR, DnsDomain)
 			_ = SSHConfig.CmdAsync(master, certCMD)
 
-			cmdHosts := fmt.Sprintf("echo %s %s >> /etc/hosts", IpFormat(s.Masters[0]), ApiServer)
+			cmdHosts := fmt.Sprintf("echo %s >> /etc/hosts", getApiserverHost(IpFormat(s.Masters[0])))
 			_ = SSHConfig.CmdAsync(master, cmdHosts)
+			// cmdMult := fmt.Sprintf("%s --apiserver-advertise-address %s", cmd, IpFormat(master))
 			_ = SSHConfig.CmdAsync(master, cmd)
-			cmdHosts = fmt.Sprintf(`sed "s/%s/%s/g" -i /etc/hosts`, IpFormat(s.Masters[0]), IpFormat(master))
+			cmdHosts = fmt.Sprintf(`sed "s/%s/%s/g" -i /etc/hosts`, getApiserverHost(IpFormat(s.Masters[0])), getApiserverHost(IpFormat(master)))
 			_ = SSHConfig.CmdAsync(master, cmdHosts)
 			copyk8sConf := `mkdir -p /root/.kube && cp -i /etc/kubernetes/admin.conf /root/.kube/config`
 			_ = SSHConfig.CmdAsync(master, copyk8sConf)
-			cleaninstall := `rm -rf /root/kube`
+			cleaninstall := `rm -rf /root/kube || :`
 			_ = SSHConfig.CmdAsync(master, cleaninstall)
 		}(master)
 	}
@@ -123,9 +132,10 @@ func (s *SealosInstaller) JoinNodes() {
 			_ = SSHConfig.CmdAsync(node, ipvsCmd) // create ipvs rules before we join node
 			cmd := s.Command(Version, JoinNode)
 			//create lvscare static pod
-			yaml := ipvs.LvsStaticPodYaml(VIP, MasterIPs, "")
+			yaml := ipvs.LvsStaticPodYaml(VIP, MasterIPs, LvscareImage)
 			_ = SSHConfig.CmdAsync(node, cmd)
-			_ = SSHConfig.CmdAsync(node, fmt.Sprintf("mkdir -p /etc/kubernetes/manifests && echo '%s' > /etc/kubernetes/manifests/kube-sealyun-lvscare.yaml", yaml))
+			_ = SSHConfig.Cmd(node, "mkdir -p /etc/kubernetes/manifests")
+			SSHConfig.CopyConfigFile(node, "/etc/kubernetes/manifests/kube-sealyun-lvscare.yaml", []byte(yaml))
 
 			cleaninstall := `rm -rf /root/kube`
 			_ = SSHConfig.CmdAsync(node, cleaninstall)
@@ -141,9 +151,9 @@ func (s *SealosInstaller) lvscare() {
 		wg.Add(1)
 		go func(node string) {
 			defer wg.Done()
-			yaml := ipvs.LvsStaticPodYaml(VIP, MasterIPs, "")
-			_ = SSHConfig.CmdAsync(node, "rm -rf  /etc/kubernetes/manifests/kube-sealyun-lvscare*")
-			_ = SSHConfig.CmdAsync(node, fmt.Sprintf("mkdir -p /etc/kubernetes/manifests && echo '%s' > /etc/kubernetes/manifests/kube-sealyun-lvscare.yaml", yaml))
+			yaml := ipvs.LvsStaticPodYaml(VIP, MasterIPs, LvscareImage)
+			_ = SSHConfig.Cmd(node, "rm -rf  /etc/kubernetes/manifests/kube-sealyun-lvscare* || :")
+			SSHConfig.CopyConfigFile(node, "/etc/kubernetes/manifests/kube-sealyun-lvscare.yaml", []byte(yaml))
 		}(node)
 	}
 
@@ -156,14 +166,15 @@ func (s *SealosInstaller) sendCaAndKey(hosts []string) {
 	SendPackage(CertPath+"/sa.key", hosts, cert.KubeDefaultCertPath, nil, nil)
 	SendPackage(CertPath+"/sa.pub", hosts, cert.KubeDefaultCertPath, nil, nil)
 	for _, ca := range caConfigs {
-		SendPackage(path.Join(ca.Path,ca.BaseName+".key"), hosts, ca.DefaultPath, nil, nil)
-		SendPackage(path.Join(ca.Path,ca.BaseName+".crt"), hosts, ca.DefaultPath, nil, nil)
+		SendPackage(path.Join(ca.Path, ca.BaseName+".key"), hosts, ca.DefaultPath, nil, nil)
+		SendPackage(path.Join(ca.Path, ca.BaseName+".crt"), hosts, ca.DefaultPath, nil, nil)
 	}
 }
+
 func (s *SealosInstaller) sendCerts(hosts []string) {
 	certConfigs := cert.CertList(CertPath, CertEtcdPath)
 	for _, cert := range certConfigs {
-		SendPackage(path.Join(cert.Path,cert.BaseName+".key"), hosts, cert.DefaultPath, nil, nil)
-		SendPackage(path.Join(cert.Path,cert.BaseName+".crt"), hosts, cert.DefaultPath, nil, nil)
+		SendPackage(path.Join(cert.Path, cert.BaseName+".key"), hosts, cert.DefaultPath, nil, nil)
+		SendPackage(path.Join(cert.Path, cert.BaseName+".crt"), hosts, cert.DefaultPath, nil, nil)
 	}
 }
